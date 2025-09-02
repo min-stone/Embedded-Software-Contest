@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1062937223093",
+    "project_id": "hahaha-79a4a",
+    "storage_bucket": "hahaha-79a4a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1062937223093:android:5cf8a10a1a5063510003fc",
+        "android_client_info": {
+          "package_name": "com.example.train_system"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCx_uPwfmSWYauvDw-zZQsbe6NryXhe6mM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
