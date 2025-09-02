@@ -9,6 +9,11 @@ import 'package:train_system/login_screen.dart';
 // API Key provided by the user
 const String apiKey = '784b4f45456a776a31313578704c5964';
 
+/// Demo-only train mapping for vision pipeline (detect2roi_final.py).
+/// These must match TRAIN_ID and CAR_NUMBER in detect2roi_final.py.
+const String kDemoTrainId = '1002-9999';
+const String kDemoCarNumber = '1';
+
 class RealtimeArrivalScreen extends StatefulWidget {
   const RealtimeArrivalScreen({super.key});
 
@@ -17,61 +22,49 @@ class RealtimeArrivalScreen extends StatefulWidget {
 }
 
 class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
-  final TextEditingController _stationController = TextEditingController();
-  List<dynamic> _arrivalData = [];
+  final TextEditingController _stationController = TextEditingController(text: '강남');
   bool _isLoadingArrivals = false;
   String _errorMessage = '';
+  List<Map<String, dynamic>> _arrivalData = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchArrivalInfo(_stationController.text);
+  }
+
+  Future<void> _logout() async {
+    await FirebaseAuth.instance.signOut();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (_) => false,
+    );
+  }
 
   Future<void> _fetchArrivalInfo(String stationName) async {
-    if (stationName.isEmpty) {
-      setState(() {
-        _errorMessage = '역 이름을 입력해주세요.';
-      });
-      return;
-    }
-
+    if (stationName.trim().isEmpty) return;
     setState(() {
       _isLoadingArrivals = true;
       _errorMessage = '';
-      _arrivalData = [];
     });
 
-    final encodedStationName = Uri.encodeComponent(stationName);
-    final url = Uri.parse(
-        'http://swopenapi.seoul.go.kr/api/subway/$apiKey/json/realtimeStationArrival/0/60/$encodedStationName');
-
     try {
-      final response = await http.get(url);
-      final data = json.decode(utf8.decode(response.bodyBytes));
-
-      if (data['errorMessage'] != null &&
-          data['errorMessage']['status'] != 200) {
-        setState(() {
-          _errorMessage = data['errorMessage']['message'];
-        });
-      } else if (data['realtimeArrivalList'] != null &&
-          (data['realtimeArrivalList'] as List).isNotEmpty) {
-        var arrivalList = data['realtimeArrivalList'] as List;
-
-        // Sort the list by line and then by direction
-        arrivalList.sort((a, b) {
-          // 1. Sort by subway line (subwayId)
-          int lineCompare = a['subwayId'].compareTo(b['subwayId']);
-          if (lineCompare != 0) {
-            return lineCompare;
-          }
-          // 2. If lines are the same, sort by destination (bstatnNm)
-          return a['bstatnNm'].compareTo(b['bstatnNm']);
-        });
-
-        setState(() {
-          _arrivalData = arrivalList;
-        });
-      } else {
-        setState(() {
-          _errorMessage = '해당 역에 대한 도착 정보가 없습니다.';
-        });
+      final url = Uri.parse(
+        'http://swopenapi.seoul.go.kr/api/subway/$apiKey/json/realtimeStationArrival/0/30/$stationName',
+      );
+      final resp = await http.get(url);
+      if (resp.statusCode != 200) {
+        throw Exception('HTTP ${resp.statusCode}');
       }
+      final data = jsonDecode(resp.body);
+
+      if (data['errorMessage']?['status'] != 200) {
+        throw Exception(data['errorMessage']?['message'] ?? 'API Error');
+      }
+
+      final List list = (data['realtimeArrivalList'] ?? []) as List;
+      _arrivalData = list.cast<Map<String, dynamic>>();
     } catch (e) {
       setState(() {
         _errorMessage = '데이터를 불러오는 중 오류가 발생했습니다: $e';
@@ -83,10 +76,10 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
     }
   }
 
-  Future<void> _showBoardingCarDialog(Map<String, dynamic> trainInfo) async {
+  void _showBoardingCarDialog(Map<String, dynamic> trainInfo) async {
     final selectedCar = await showDialog<int>(
       context: context,
-      builder: (BuildContext context) {
+      builder: (context) {
         return AlertDialog(
           title: const Text('탑승 칸 선택'),
           content: SizedBox(
@@ -98,14 +91,12 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
                 crossAxisSpacing: 8,
                 mainAxisSpacing: 8,
               ),
-              itemCount: 10, // Assuming 10 cars
+              itemCount: 10, // 10칸 가정
               itemBuilder: (context, index) {
                 final carNumber = index + 1;
                 return ElevatedButton(
                   child: Text('$carNumber'),
-                  onPressed: () {
-                    Navigator.of(context).pop(carNumber);
-                  },
+                  onPressed: () => Navigator.of(context).pop(carNumber),
                 );
               },
             ),
@@ -118,58 +109,19 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
       final trainId = '${trainInfo['subwayId']}-${trainInfo['btrainNo']}';
       final carNumber = selectedCar.toString();
 
-      // DEBUG: Print trainId and carNumber for the Python script
+      // DEBUG
       // ignore: avoid_print
       print('DEBUG: Navigating to SeatReservationScreen with trainId: $trainId, carNumber: $carNumber');
 
       if (!mounted) return;
-      Navigator.push(
-        context,
+      Navigator.of(context).push(
         MaterialPageRoute(
-          builder: (context) => SeatReservationScreen(
+          builder: (_) => SeatReservationScreen(
             trainId: trainId,
             carNumber: carNumber,
           ),
         ),
       );
-    }
-  }
-
-  Future<void> _logout() async {
-    try {
-      await FirebaseAuth.instance.signOut();
-      if (!mounted) return;
-      // 로그인 화면으로 스택을 초기화하며 이동
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const LoginScreen()),
-        (route) => false,
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('로그아웃 실패: $e')),
-      );
-    }
-  }
-
-  @override
-  void dispose() {
-    _stationController.dispose();
-    super.dispose();
-  }
-
-  Map<String, dynamic> _getLineInfo(String subwayId) {
-    switch (subwayId) {
-      case '1001': return {'name': '1', 'color': const Color(0xFF0052A4)};
-      case '1002': return {'name': '2', 'color': const Color(0xFF00A84D)};
-      case '1003': return {'name': '3', 'color': const Color(0xFFEF7C1C)};
-      case '1004': return {'name': '4', 'color': const Color(0xFF00A4E3)};
-      case '1005': return {'name': '5', 'color': const Color(0xFF996CAC)};
-      case '1006': return {'name': '6', 'color': const Color(0xFFCD7C2F)};
-      case '1007': return {'name': '7', 'color': const Color(0xFF747F00)};
-      case '1008': return {'name': '8', 'color': const Color(0xFFE6186C)};
-      case '1009': return {'name': '9', 'color': const Color(0xFFBDB092)};
-      default: return {'name': '?', 'color': Colors.grey};
     }
   }
 
@@ -179,6 +131,21 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
       appBar: AppBar(
         title: const Text('실시간 지하철 도착 정보'),
         actions: [
+          // --- DEMO 진입(상단 버튼) ---
+          IconButton(
+            tooltip: 'DEMO',
+            icon: const Icon(Icons.play_circle_outline),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const SeatReservationScreen(
+                    trainId: kDemoTrainId,
+                    carNumber: kDemoCarNumber,
+                  ),
+                ),
+              );
+            },
+          ),
           IconButton(
             tooltip: '로그아웃',
             icon: const Icon(Icons.logout),
@@ -205,6 +172,26 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
             ),
             const SizedBox(height: 20),
 
+            // --- DEMO 열차(목록 상단 카드) ---
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.play_circle_outline),
+                title: const Text('DEMO 열차 (Vision 테스트)'),
+                subtitle: const Text('trainId: 1002-9999 · car: 1'),
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const SeatReservationScreen(
+                        trainId: kDemoTrainId,
+                        carNumber: kDemoCarNumber,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+
             // Arrival Info List
             if (_isLoadingArrivals)
               const Center(child: CircularProgressIndicator())
@@ -216,19 +203,22 @@ class _RealtimeArrivalScreenState extends State<RealtimeArrivalScreen> {
                   itemCount: _arrivalData.length,
                   itemBuilder: (context, index) {
                     final item = _arrivalData[index];
-                    final lineInfo = _getLineInfo(item['subwayId']);
-                    final lineColor = lineInfo['color'] as Color;
-                    final lineName = lineInfo['name'] as String;
-
                     return Card(
-                      margin: const EdgeInsets.symmetric(vertical: 8.0),
                       child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: lineColor,
+                        leading: Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: Theme.of(context).colorScheme.primary,
+                            shape: BoxShape.circle,
+                          ),
+                          alignment: Alignment.center,
                           child: Text(
-                            lineName,
+                            '${item['subwayId'] ?? ''}',
                             style: const TextStyle(
-                                color: Colors.white, fontWeight: FontWeight.bold),
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                         ),
                         title: Text('${item['bstatnNm']}행 - ${item['arvlMsg2']}'),
