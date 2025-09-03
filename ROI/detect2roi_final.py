@@ -15,17 +15,21 @@ VIDEO_SRC    = 'test_video2.mp4'   # '0' → 웹캠, 그 외는 파일 경로
 MODEL_PATH   = 'yolov8n-pose.pt'
 ROI_JSON     = 'seat_roi.json'
 CONF         = 0.3
-SERVICE_KEY  = 'hahaha-79a4a-firebase-adminsdk-fbsvc-259d08c49e.json'
+SERVICE_KEY  = 'hahaha-79a4a-77a0d09dc1d4.json'
 HOLD_SEC     = 1.0
 
-TRAIN_ID     = '1002-8329'  # ★ Flutter와 동일하게 맞추기
+TRAIN_ID     = '1002-9999'  # ★ Flutter와 동일하게 맞추기
 CAR_NUMBER   = '1'          # ★ Flutter와 동일하게 맞추기
+
+# ⚡ 프레임 스킵(추론 간격): 1이면 스킵 안 함, 2면 2프레임에 1번 추론
+FRAME_STRIDE = 2
 # ------------------------------------------------
 
 # -------------------- Firestore --------------------
 _FIREBASE_OK = False
 _db = None
 _SEAT_DOC_CACHE = {}  # "seatNumber(str)" -> doc.reference
+_LAST_WRITTEN_OCC = {}  # "seatId(str)" -> bool, 마지막으로 Firestore에 쓴 점유 상태
 
 try:
     import firebase_admin
@@ -85,43 +89,68 @@ def write_occupancy_to_firestore(occ: dict):
     """
     occ: {"1": True, "2": False, ...}
     - seatNumber 로 기존 문서를 찾되 없으면 문서ID=seatNumber 로 생성
-    - 비전 결과는 isOccupied 만 갱신 (reserved/reservedBy는 유지)
+    - 비전 결과는 isOccupied 갱신
+    - 추가: isOccupied 가 True->False 로 바뀌는 "하강 에지"에서 reserved 를 False 로 자동 해제 + reservedBy 삭제
     """
     if not _FIREBASE_OK:
         return
+
+    global _LAST_WRITTEN_OCC
     col = seats_collection()
     batch = _db.batch()
+
+    # 하강 에지(occupied True -> False) 좌석 계산
+    falling_keys = set()
+    for sid_raw, taken in occ.items():
+        key = str(int(sid_raw))      # "05" -> "5"
+        prev = _LAST_WRITTEN_OCC.get(key)
+        curr = bool(taken)
+        if prev is True and curr is False:
+            falling_keys.add(key)
+
     try:
         for sid_raw, taken in occ.items():
-            key = str(int(sid_raw))  # "05" → "5"
+            key = str(int(sid_raw))
             ref = _SEAT_DOC_CACHE.get(key)
 
             if ref is None:
-                # seatNumber 로 단발 조회(랜덤ID를 쓰고 있을 수도 있으니)
-                try:
-                    q = col.where("seatNumber", "==", int(key)).limit(1).stream()
-                    found = next(q, None)
-                except StopIteration:
-                    found = None
-                if found is not None:
+                # 문서 캐시 없으면 find-or-create
+                q = col.where("seatNumber", "==", int(key)).limit(1).stream()
+                found = None
+                for d in q: found = d
+                if found is None:
+                    ref = col.document(key)
+                else:
                     ref = found.reference
-                    _SEAT_DOC_CACHE[key] = ref
-
-            if ref is None:
-                # 문서ID = 좌석번호로 생성
-                ref = col.document(key)
                 _SEAT_DOC_CACHE[key] = ref
 
-            print(f"[Firestore] upsert /trains/{TRAIN_ID}/cars/{CAR_NUMBER}/seats/{key}  isOccupied={bool(taken)}")
-            batch.set(ref, {
+            # 기본 갱신 필드
+            data = {
                 "seatNumber": int(key),
                 "isOccupied": bool(taken),
                 "visionUpdatedAt": firestore.SERVER_TIMESTAMP
-            }, merge=True)  # reserved/reservedBy는 변경하지 않음
+            }
+
+            # 하강 에지에서 예약 해제 + 예약자 삭제
+            if key in falling_keys:
+                data["reserved"] = False
+                from firebase_admin import firestore as _fs
+                data["reservedBy"] = _fs.DELETE_FIELD
+
+            print(f"[Firestore] upsert /trains/{TRAIN_ID}/cars/{CAR_NUMBER}/seats/{key}  "
+                  f"isOccupied={bool(taken)}"
+                  f"{'  (clear reserved)' if key in falling_keys else ''}")
+
+            batch.set(ref, data, merge=True)
 
         batch.commit()
+
+        # 마지막으로 쓴 상태 캐싱(다음 호출에서 에지 판별용)
+        _LAST_WRITTEN_OCC = {str(int(k)): bool(v) for k, v in occ.items()}
+
     except Exception as e:
         print(f"[WARN] Firestore 쓰기 실패: {e}")
+
 # ---------------------------------------------------
 
 # -------------------- 비전 유틸 --------------------
@@ -279,8 +308,13 @@ def main():
                 rois = {str(k): np.array(v, np.int32) for k, v in rois.items()}
                 seat_centers = {str(sid): poly_centroid(poly) for sid, poly in rois.items()}
 
-            t = time.time() - start_ts
+            # ⚡ 프레임 스킵: N프레임마다 한 번만 추론
+            if FRAME_STRIDE > 1 and (fno % FRAME_STRIDE != 0):
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                continue
 
+            t = time.time() - start_ts
             occ = compute_occupancy(frame, model, rois, seat_centers, conf=CONF)
 
             # 디바운스
@@ -354,6 +388,13 @@ def main():
             if pos_msec and pos_msec > 0:  t = pos_msec / 1000.0
             elif fps:                      t = (fno - 1) / fps
             else:                          t = time.time() - start_ts
+
+            # ⚡ 프레임 스킵: N프레임마다 한 번만 추론
+            if FRAME_STRIDE > 1 and (fno % FRAME_STRIDE != 0):
+                ok, frame = cap.read()
+                if not ok: break
+                fno += 1
+                continue
 
             occ = compute_occupancy(frame, model, rois, seat_centers, conf=CONF)
 
