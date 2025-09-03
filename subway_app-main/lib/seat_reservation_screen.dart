@@ -32,6 +32,9 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
   StreamSubscription? _seatListener;
   final Set<String> _dialogsShownForSeats = {};
 
+  // ✅ 확정(로컬 UI 전용) 좌석 집합
+  final Set<String> _confirmedSeats = {};
+
   @override
   void initState() {
     super.initState();
@@ -56,7 +59,6 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
     final doc = await _carDocRef.get();
     if (!doc.exists) {
       final batch = _db.batch();
-      // userSeatLookup: uid -> seatId 맵(빈 맵으로 생성)
       batch.set(_carDocRef, {
         'createdAt': FieldValue.serverTimestamp(),
         'userSeatLookup': <String, dynamic>{},
@@ -66,7 +68,7 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
         final ref = _seatsCollectionRef.doc(i.toString()); // seat doc id = seat number
         batch.set(ref, {
           'seatNumber': i,
-          'isPriority': (i == 1 || i == 6), // Original priority seat logic
+          'isPriority': (i == 1 || i == 6),
           'reserved': false,
           'reservedBy': null,
           'isOccupied': false,
@@ -75,36 +77,63 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
       }
       await batch.commit();
     } else {
-      // 기존 문서에 userSeatLookup 필드가 없을 수 있으므로 한 번 보정(선택적)
       if (!(doc.data() as Map<String, dynamic>).containsKey('userSeatLookup')) {
         await _carDocRef.update({'userSeatLookup': <String, dynamic>{}});
       }
     }
   }
 
-  void _listenForOccupiedSeats() {
-    if (_me == null) return;
-    _seatListener = _seatsCollectionRef
-        .where('reservedBy', isEqualTo: _me!.uid)
-        .snapshots()
-        .listen((snapshot) {
-      for (final docChange in snapshot.docChanges) {
-        if (docChange.type == DocumentChangeType.modified) {
-          final doc = docChange.doc;
-          final data = doc.data() as Map<String, dynamic>;
-          final isOccupied = data['isOccupied'] ?? false;
-          final seatId = doc.id;
+ void _listenForOccupiedSeats() {
+  _seatListener?.cancel();
+  if (_me == null) return;
 
-          if (isOccupied && !_dialogsShownForSeats.contains(seatId)) {
-            _showOccupiedConfirmDialog();
-            _dialogsShownForSeats.add(seatId);
-          }
-        }
+  _seatListener = _seatsCollectionRef
+      .where('reservedBy', isEqualTo: _me!.uid)
+      .snapshots()
+      .listen((snapshot) {
+    for (final change in snapshot.docChanges) {
+      final seatId = change.doc.id;
+
+      // 쿼리에서 빠질 때(예약 취소/예약자 변경) → 모든 로컬 표시 초기화
+      if (change.type == DocumentChangeType.removed) {
+        if (!mounted) continue;
+        setState(() {
+          _dialogsShownForSeats.remove(seatId);
+          _confirmedSeats.remove(seatId);
+        });
+        continue;
       }
-    });
-  }
 
-  Future<void> _showOccupiedConfirmDialog() async {
+      // added/modified 공통 처리
+      final data = change.doc.data() as Map<String, dynamic>?;
+      if (data == null) continue;
+
+      final bool isOccupied = data['isOccupied'] == true;
+      final bool reserved   = data['reserved'] == true;
+      final bool stillMine  = reserved && data['reservedBy'] == _me!.uid;
+
+      // 착석했고 여전히 내 예약이면 → 좌석별로 한 번만 다이얼로그
+      if (isOccupied && stillMine && !_dialogsShownForSeats.contains(seatId)) {
+        _dialogsShownForSeats.add(seatId);
+        _showOccupiedConfirmDialog(seatId);
+      }
+
+      // 하차(occupied=false) 또는 더 이상 내 좌석 아님 → 다시 뜰 수 있게 초기화
+      if (!isOccupied || !stillMine) {
+        if (!mounted) continue;
+        setState(() {
+          _dialogsShownForSeats.remove(seatId);
+          _confirmedSeats.remove(seatId);
+        });
+      }
+    }
+  });
+}
+
+
+  // ✅ 좌석 ID를 받아 확정 시 UI만 갱신
+  Future<void> _showOccupiedConfirmDialog(String seatId) async {
+    if (!mounted) return;
     return showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -122,6 +151,11 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
             TextButton(
               child: const Text('네, 맞습니다'),
               onPressed: () {
+                if (mounted) {
+                  setState(() {
+                    _confirmedSeats.add(seatId); // ✅ 로컬 확정 표시만 추가
+                  });
+                }
                 Navigator.of(context).pop();
               },
             ),
@@ -142,6 +176,7 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
         : '이 좌석을 예약하시겠습니까?';
     final confirmActionText = isCurrentlyReserved ? '예약 취소' : '예약';
 
+    if (!mounted) return;
     return showDialog<void>(
       context: context,
       builder: (BuildContext context) {
@@ -175,7 +210,6 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
 
     try {
       await _db.runTransaction((tx) async {
-        // 1) car 문서 읽고, 내가 이미 어떤 좌석을 갖고 있는지 확인
         final carSnap = await tx.get(_carDocRef);
         if (!carSnap.exists) {
           throw Exception('차량 정보가 존재하지 않습니다.');
@@ -186,7 +220,6 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
                 <String, dynamic>{};
         final existingSeatId = userSeatLookup[myUid] as String?;
 
-        // 2) 선택한 좌석 문서 읽기
         final snap = await tx.get(seatRef);
         if (!snap.exists) {
           throw Exception('좌석 정보가 존재하지 않습니다.');
@@ -202,37 +235,28 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
         final reservedBy = d['reservedBy'] as String?;
 
         if (!reserved) {
-          // 예약을 새로 하려는 경우: 이미 다른 좌석을 갖고 있으면 거절
           if (existingSeatId != null && existingSeatId.isNotEmpty && existingSeatId != seatId) {
             throw Exception('이미 다른 좌석($existingSeatId)을 예약 중입니다. 먼저 취소해주세요.');
           }
-
-          // 좌석이 비어 있고, 나도 아직 맵에 없거나(=이 좌석을 처음 예약) 같은 좌석을 다시 누른 경우만 허용
           tx.update(seatRef, {
             'reserved': true,
             'reservedBy': myUid,
             'updatedAt': FieldValue.serverTimestamp(),
           });
-
-          // userSeatLookup.{uid} = seatId
           tx.update(_carDocRef, {
             'userSeatLookup.$myUid': seatId,
           });
         } else {
-          // 이미 예약됨
           if (reservedBy == myUid) {
-            // 내가 예약한 좌석이면: 취소(토글)
             tx.update(seatRef, {
               'reserved': false,
               'reservedBy': null,
               'updatedAt': FieldValue.serverTimestamp(),
             });
-            // userSeatLookup에서 내 키 제거
             tx.update(_carDocRef, {
               'userSeatLookup.$myUid': FieldValue.delete(),
             });
           } else {
-            // 다른 사람이 예약한 좌석
             throw Exception('이미 다른 사용자가 예약했습니다.');
           }
         }
@@ -242,6 +266,13 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('처리가 완료되었습니다. (좌석: $seatId)')),
       );
+
+      // 내가 직접 예약을 취소했다면, 로컬 확정도 해제
+      if (mounted && _confirmedSeats.contains(seatId)) {
+        setState(() {
+          _confirmedSeats.remove(seatId);
+        });
+      }
     } catch (e) {
       if (!mounted) return;
       final msg = e.toString().replaceFirst('Exception: ', '');
@@ -249,21 +280,22 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
     }
   }
 
-  Color _seatColor(Map<String, dynamic> d, String? myUid) {
+  // ✅ 색상 계산: 확정(보라) > 내가 예약(초록) > 남이 예약(빨강) > 점유 중(파랑) > 일반/우선석
+  Color _seatColor(Map<String, dynamic> d, String seatId, String? myUid) {
     final reserved = d['reserved'] == true;
     final reservedBy = d['reservedBy'];
     final isPriority = d['isPriority'] == true;
-    final isOccupied = d['isOccupied'] == true; // ← 파이썬이 쓰는 필드
+    final isOccupied = d['isOccupied'] == true;
 
-    if (reserved && reservedBy == myUid) {
-      return Colors.green; // 내가 예약한 좌석
+    // 확정 색상은 "내가 예약했고(is mine) 착석 상태"일 때만 표시(조건 해제되면 자동 원복)
+    final isMine = reserved && reservedBy == myUid;
+    if (_confirmedSeats.contains(seatId) && isMine && isOccupied) {
+      return Colors.purple; // ✅ 확정 상태(로컬 UI)
     }
-    if (reserved) {
-      return Colors.red; // 다른 사람이 예약함
-    }
-    if (isOccupied) {
-      return Colors.blue; // 비예약 상태지만 실제 사람이 앉아 있음
-    }
+
+    if (isMine) return Colors.green; // 내가 예약한 좌석
+    if (reserved) return Colors.red;  // 다른 사람이 예약
+    if (isOccupied) return Colors.blue; // 예약은 없지만 실제 점유 중
     return isPriority ? Colors.pink.shade200 : Colors.grey.shade400;
   }
 
@@ -271,7 +303,7 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
     final d = doc.data() as Map<String, dynamic>;
     final seatNumber = d['seatNumber'] ?? 0;
     final isPriority = d['isPriority'] == true;
-    final color = _seatColor(d, _me?.uid);
+    final color = _seatColor(d, doc.id, _me?.uid); // ✅ seatId 전달
 
     return GestureDetector(
       onTap: () => _showReservationConfirmDialog(doc),
@@ -300,14 +332,12 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
   }
 
   Future<void> _signOut() async {
-    // 화면을 먼저 정리해서 StreamBuilder가 dispose되도록 함
     if (mounted) {
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(builder: (_) => const LoginScreen()),
         (route) => false,
       );
     }
-    // 다음 틱에서 실제 로그아웃 실행 (현재 화면 dispose 보장)
     Future.microtask(() => FirebaseAuth.instance.signOut());
   }
 
@@ -345,7 +375,6 @@ class _SeatReservationScreenState extends State<SeatReservationScreen> {
 
               if (snap.hasError) {
                 final err = snap.error;
-                // 권한 오류면 조용히 로그인으로 리다이렉트
                 if (err is FirebaseException && err.code == 'permission-denied') {
                   Future.microtask(() {
                     if (!mounted) return;
